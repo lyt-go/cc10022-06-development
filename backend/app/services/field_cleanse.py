@@ -1,10 +1,15 @@
-"""字段清洗领域服务：标准化函数执行、修正字典匹配与字段完整性校验。"""
+"""字段清洗领域服务：标准化函数执行、修正字典匹配与字段完整性校验。
+
+清洗规则也承担补值返工的复验职责：原始行被修改后，先复验字段是否
+真的补齐，再关闭对应的返工事项；复验不通过的事项保持打开。
+"""
 from __future__ import annotations
 
 import re
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import rework as rework_rules
 from app.store import store
 
 
@@ -136,3 +141,81 @@ class FieldCleanseService(BaseModuleService):
                         # 标准化字段值：执行完整清洗流水线并更新记录
                         record[target_field] = result["cleansed"]
         return records
+
+    # ── 补值返工复验 ──
+
+    def revalidate_rework_items(self, entity_model: str,
+                                 records: list[dict[str, Any]] | None = None,
+                                 *, source_records: list[dict[str, Any]] | None = None,
+                                 verifier: str = "字段标准化清洗") -> dict[str, Any]:
+        """复验改过的原始行：字段补齐后关闭对应返工项。
+
+        原始行默认按“来源记录”唯一键合并：先取 source_record 中已修改的
+        原始行，再用传入 records 覆盖同键行。复验只关闭本轮确实能取到
+        非空值的返工项，未补齐的事项保持打开并回写复验结果。
+        """
+        merged = self._merge_source_rows(entity_model, records, source_records)
+        closed: list[dict[str, Any]] = []
+        still_open: list[dict[str, Any]] = []
+        unmatched: list[dict[str, Any]] = []
+        for item in rework_rules.rework_rows(entity_model):
+            if rework_rules.is_closed(item):
+                continue
+            source_record = str(item.get("来源记录") or item.get("源记录") or "")
+            field = str(item.get("字段") or item.get("待补字段") or "")
+            record = merged.get(source_record)
+            if record is None:
+                unmatched.append(item)
+                continue
+            value = rework_rules.field_value(record, field)
+            if value.strip():
+                rework_rules.close_rework_item(
+                    item, verified_value=value, verifier=verifier)
+                closed.append(item)
+            else:
+                item["复验时间"] = rework_rules.now_iso()
+                item["复验值"] = value
+                item["复验人"] = verifier
+                item["补齐状态"] = "未补齐"
+                item["可派发"] = rework_rules.is_dispatchable(item)
+                still_open.append(item)
+        return {
+            "entity_model": entity_model,
+            "closed": len(closed),
+            "still_open": len(still_open),
+            "unmatched": len(unmatched),
+            "closed_ids": [row.get("id") for row in closed],
+            "still_open_ids": [row.get("id") for row in still_open],
+            "unmatched_ids": [row.get("id") for row in unmatched],
+        }
+
+    def revalidate_and_close_rework(self, entity_model: str,
+                                     records: list[dict[str, Any]] | None = None,
+                                     *, source_records: list[dict[str, Any]] | None = None,
+                                     verifier: str = "字段标准化清洗") -> dict[str, Any]:
+        """复验并关闭返工项：与 revalidate_rework_items 同一套复验规则。"""
+        return self.revalidate_rework_items(
+            entity_model, records, source_records=source_records, verifier=verifier)
+
+    @staticmethod
+    def _merge_source_rows(entity_model: str,
+                            records: list[dict[str, Any]] | None,
+                            source_records: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+        """按来源记录合并原始行，后传入的同键行覆盖先前的行。"""
+        merged: dict[str, dict[str, Any]] = {}
+        rows = source_records
+        if rows is None:
+            rows = [
+                row for row in store.rows("source_record")
+                if str(row.get("实体模型", entity_model)) == entity_model
+            ]
+        for index, row in enumerate(rows):
+            key = rework_rules.source_record_id(row, index, entity_model)
+            merged[key] = dict(row)
+        for index, row in enumerate(records or []):
+            key = rework_rules.source_record_id(row, index, entity_model)
+            base = merged.get(key, {})
+            combined = dict(base)
+            combined.update(row)
+            merged[key] = combined
+        return merged

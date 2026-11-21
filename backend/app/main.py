@@ -5,14 +5,29 @@
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.services.mdm_quality import MdmQualityService
 from app.store import store
 
-app = FastAPI(title="主数据清洗与黄金记录平台", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 启动时重算一次历史检查数据，工作台直接能看到派发视图和缺字段证据。
+    # 轮次由报告编号决定，重复启动不会把同一批缺字段证据翻成新一轮。
+    quality_service = MdmQualityService()
+    quality_service.recompute_quality_check(
+        "customer", report_id="RPT-20261120", source_system="")
+    yield
+
+
+app = FastAPI(
+    title="主数据清洗与黄金记录平台", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
